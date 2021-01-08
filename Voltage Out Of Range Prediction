@@ -1,0 +1,187 @@
+import azureml.core
+import logging
+import pandas as pd
+import numpy as np
+import os
+import warnings
+warnings.showwarning = lambda *args, **kwargs: None
+
+from align_outputs import align_outputs
+from azureml.automl.core.featurization import FeaturizationConfig
+from azureml.automl.core.shared import constants, metrics
+from azureml.core import Experiment, Workspace, Dataset, Datastore, VERSION
+from azureml.core.compute import ComputeTarget, AmlCompute
+from azureml.core.compute_target import ComputeTargetException
+from azureml.data.datapath import DataPath
+from azureml.train.automl import AutoMLConfig
+from datetime import datetime
+from matplotlib import pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+
+print("This notebook was created using version 1.5.0 of the Azure ML SDK")
+print("You are currently using version", azureml.core.VERSION, "of the Azure ML SDK")
+print()
+
+ws = Workspace.from_config()
+
+experiment_name = 'automl-forecasting-voltageoutofrange'
+
+# project folder
+# project_folder = './sample_projects/automl-forecasting-energy-demand'
+
+experiment = Experiment(ws, experiment_name)
+
+output = {}
+output['Subscription ID'] = ws.subscription_id
+output['Workspace'] = ws.name
+output['Resource Group'] = ws.resource_group
+output['Location'] = ws.location
+output['Run History Name'] = experiment_name
+pd.set_option('display.max_colwidth', -1)
+outputDf = pd.DataFrame(data = output, index = [''])
+outputDf.T
+
+# Choose a name for your cluster.
+amlcompute_cluster_name = "Standard-D515-v2"
+
+# Verify that cluster does not exist already
+try:
+    compute_target = ComputeTarget(workspace=ws, name=amlcompute_cluster_name)
+    print('Found existing cluster, use it.')
+except ComputeTargetException:
+    compute_config = AmlCompute.provisioning_configuration(vm_size = 'STANDARD_D515-V2', max_nodes = 6)
+    compute_target = ComputeTarget.create(ws, amlcompute_cluster_name, compute_config)
+
+compute_target.wait_for_completion(show_output = True)
+
+
+datastore = ws.get_default_datastore()
+datastore.upload_files(files = ['//GAXGPFS01/TBJAMISO$/Python/VOR-Dataset.csv'],
+                       overwrite = True,
+                       show_progress = True)
+
+target_column_name = 'Voltage'
+time_column_name = 'SampleDateTime'
+max_horizon = 48
+
+dataset = Dataset.Tabular.from_delimited_files(path = [(datastore, 'VOR-Dataset.csv')]).with_timestamp_columns(fine_grain_timestamp = time_column_name)
+
+year = datetime.today().year
+month = datetime.today().month
+day = datetime.today().day
+
+train = dataset.time_before(datetime(year, month, day), include_boundary=True)
+train.to_pandas_dataframe().reset_index(drop = True).sort_values(time_column_name).tail(5)
+
+test = dataset.time_after(datetime(year, month, day), include_boundary=True)
+test.to_pandas_dataframe().reset_index(drop = True).head(5)
+
+# test, train = dataset.random_split(0.3, seed = 123)
+
+test.to_pandas_dataframe().reset_index(drop = True).sort_values(time_column_name)
+train.to_pandas_dataframe().reset_index(drop = True).sort_values(time_column_name)
+
+automl_settings = {'time_column_name': time_column_name,
+                   'max_horizon': max_horizon
+                  }
+
+automl_config = AutoMLConfig(task = 'forecasting',                             
+                             primary_metric = 'r2_score',
+                             experiment_timeout_hours = 0.8,
+                             training_data = train,
+                             label_column_name = target_column_name,
+                             compute_target = compute_target,
+                             enable_early_stopping = True,
+                             n_cross_validations = 10,                             
+                             verbosity = logging.INFO,
+                             max_cores_per_iteration = -1,
+                            **automl_settings)
+
+remote_run = experiment.submit(automl_config, show_output = True)
+remote_run
+remote_run.wait_for_completion()
+
+# Retrieve Best Model
+best_run, fitted_model = remote_run.get_output()
+fitted_model.steps
+
+# Featurization
+fitted_model.named_steps['timeseriestransformer'].get_engineered_feature_names()
+featurization_summary = fitted_model.named_steps['timeseriestransformer'].get_featurization_summary()
+
+print(pd.DataFrame.from_records(featurization_summary))
+
+# Forecasting
+X_test = test.to_pandas_dataframe().reset_index(drop = True)
+y_test = X_test.pop(target_column_name).values
+
+y_predicted, X_trans = fitted_model.forecast(X_test)
+
+df_all = align_outputs(y_predicted, X_trans, y_test, target_column_name, predicted_column_name = 'predicted', horizon_colname = 'horizon_origin')
+
+# use automl metrics module
+scores = metrics.compute_metrics_regression(
+    df_all['predicted'],
+    df_all[target_column_name],
+    list(constants.Metric.SCALAR_REGRESSION_SET),
+    None, None, None)
+
+print("[Test data scores]\n")
+for key, value in scores.items():    
+    print('{}:   {:.3f}'.format(key, value))
+    
+# Plot outputs
+# matplotlib inline
+test_pred = plt.scatter(df_all[target_column_name], df_all['predicted'], color = 'b')
+test_test = plt.scatter(df_all[target_column_name], df_all[target_column_name], color = 'g')
+plt.legend((test_pred, test_test), ('prediction', 'truth'), loc = 'upper left', fontsize = 8)
+plt.show()
+
+print(X_trans)
+
+
+automl_advanced_settings = {
+    'time_column_name': time_column_name,
+    'max_horizon': max_horizon,
+    'target_lags': 12,
+    'target_rolling_window_size': 4,
+}
+
+automl_config = AutoMLConfig(task = 'forecasting',                             
+                             primary_metric = 'r2_score',
+                            #  blacklist_models = ['ElasticNet','ExtremeRandomTrees','GradientBoosting','XGBoostRegressor','AutoArima', 'Prophet'], #These models are blacklisted for tutorial purposes, remove this for real use cases.
+                             experiment_timeout_hours = 0.8,
+                             training_data = train,
+                             label_column_name = target_column_name,
+                             compute_target = compute_target,
+                             enable_early_stopping = True,
+                             n_cross_validations = 10,                             
+                             verbosity = logging.INFO,
+                            **automl_advanced_settings)
+
+
+advanced_remote_run = experiment.submit(automl_config, show_output = False)
+advanced_remote_run.wait_for_completion()
+best_run_lags, fitted_model_lags = advanced_remote_run.get_output()
+
+y_predictions, X_trans = fitted_model_lags.forecast(X_test)
+
+df_all = align_outputs(y_predictions, X_trans, X_test, y_test, target_column_name)
+
+scores = metrics.compute_metrics_regression(
+                                            df_all['predicted'],
+                                            df_all[target_column_name],
+                                            list(constants.Metric.SCALAR_REGRESSION_SET),
+                                            None, None, None
+                                           )
+
+print("[Test data scores]\n")
+for key, value in scores.items():
+    print('{}:   {:.3f}'.format(key, value))
+    
+# Plot outputs
+test_pred = plt.scatter(df_all[target_column_name], df_all['predicted'], color = 'b')
+test_test = plt.scatter(df_all[target_column_name], df_all[target_column_name], color = 'g')
+plt.legend((test_pred, test_test), ('prediction', 'truth'), loc = 'upper left', fontsize = 8)
+plt.show()
